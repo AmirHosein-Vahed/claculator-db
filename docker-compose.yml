@@ -1,0 +1,15 @@
+services:
+  calc:
+    build: .
+    image: local/calc:latest
+    # Stable name so the entry point is simply `docker exec calc calc "2+3*4"`.
+    container_name: calc
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    environment:
+      CALC_DB: /data/calc.db
+    volumes:
+      - calc-data:/data
+
+volumes:
+  calc-data:
