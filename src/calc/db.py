@@ -1,116 +1,73 @@
-"""SQLite persistence for calculation history.
-
-The schema is created on demand, so there is no migration step and no separate
-init container: the first invocation in a fresh volume creates the table.
-"""
-
-from __future__ import annotations
-
 import os
-import sqlite3
+import psycopg2
 from contextlib import contextmanager
 from dataclasses import dataclass
 from collections.abc import Iterator
-from pathlib import Path
-
-DEFAULT_DB_PATH = "calc.db"
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS calculations (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    expression TEXT NOT NULL,
-    result     TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_calc_created_at ON calculations(created_at);
-"""
-
-_COLUMNS = "id, expression, result, created_at"
-
-
-class StorageError(RuntimeError):
-    """Raised when the database cannot be opened, read, or written."""
-
 
 @dataclass(frozen=True)
 class Calculation:
-    """A single stored calculation."""
-
     id: int
     expression: str
     result: str
     created_at: str
 
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.environ.get("DB_HOST", "localhost"),
+        port=os.environ.get("DB_PORT", "5432"),
+        user=os.environ.get("DB_USER", "postgres"),
+        password=os.environ.get("DB_PASSWORD", "password"),
+        dbname=os.environ.get("DB_NAME", "postgres")
+    )
 
-def database_path() -> Path:
-    """Location of the SQLite file, from ``CALC_DB`` or the working directory."""
-    return Path(os.environ.get("CALC_DB") or DEFAULT_DB_PATH)
-
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS calculations (
+    id         SERIAL PRIMARY KEY,
+    expression TEXT NOT NULL,
+    result     TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+"""
 
 @contextmanager
-def _connect() -> Iterator[sqlite3.Connection]:
-    path = database_path()
+def _connect() -> Iterator:
+    conn = get_db_connection()
     try:
-        connection = sqlite3.connect(path)
-    except sqlite3.Error as exc:
-        raise StorageError(
-            f"could not open database at {path}: {exc} "
-            f"(does the directory exist and is it writable?)"
-        ) from exc
-
-    try:
-        connection.row_factory = sqlite3.Row
-        connection.executescript(_SCHEMA)
-        yield connection
-        connection.commit()
-    except sqlite3.Error as exc:
-        connection.rollback()
-        raise StorageError(f"database error at {path}: {exc}") from exc
+        with conn.cursor() as cur:
+            cur.execute(_SCHEMA)
+            conn.commit()
+        yield conn
     finally:
-        connection.close()
-
-
-def _to_calculation(row: sqlite3.Row) -> Calculation:
-    return Calculation(**dict(row))
-
+        conn.close()
 
 def save(expression: str, result: str) -> Calculation:
-    """Insert one calculation and return the stored record."""
-    with _connect() as connection:
-        cursor = connection.execute(
-            "INSERT INTO calculations (expression, result) VALUES (?, ?)",
-            (expression, result),
-        )
-        row = connection.execute(
-            f"SELECT {_COLUMNS} FROM calculations WHERE id = ?",
-            (cursor.lastrowid,),
-        ).fetchone()
-        return _to_calculation(row)
-
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO calculations (expression, result) VALUES (%s, %s) RETURNING id, expression, result, created_at",
+                (expression, result)
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return Calculation(id=row[0], expression=row[1], result=row[2], created_at=str(row[3]))
 
 def history(limit: int = 20) -> list[Calculation]:
-    """Return up to ``limit`` calculations, most recent first."""
-    limit = max(1, limit)
-    with _connect() as connection:
-        rows = connection.execute(
-            f"SELECT {_COLUMNS} FROM calculations ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [_to_calculation(row) for row in rows]
-
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, expression, result, created_at FROM calculations ORDER BY id DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            return [Calculation(id=r[0], expression=r[1], result=r[2], created_at=str(r[3])) for r in rows]
 
 def get(identifier: int) -> Calculation | None:
-    """Return a single calculation by id, or ``None`` if it does not exist."""
-    with _connect() as connection:
-        row = connection.execute(
-            f"SELECT {_COLUMNS} FROM calculations WHERE id = ?",
-            (identifier,),
-        ).fetchone()
-    return _to_calculation(row) if row is not None else None
-
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, expression, result, created_at FROM calculations WHERE id = %s", (identifier,))
+            row = cur.fetchone()
+            return Calculation(id=row[0], expression=row[1], result=row[2], created_at=str(row[3])) if row else None
 
 def clear() -> int:
-    """Delete all calculations and return how many rows were removed."""
-    with _connect() as connection:
-        cursor = connection.execute("DELETE FROM calculations")
-        return cursor.rowcount
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM calculations")
+            conn.commit()
+            return cur.rowcount

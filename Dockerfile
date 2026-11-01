@@ -1,7 +1,13 @@
 FROM python:3.12-slim
 
-# The application is pure standard library (sqlite3, ast, argparse, dataclasses),
-# so there is nothing to install and no network access beyond pulling this image.
+# The application now uses PostgreSQL.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq-dev \
+        gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
